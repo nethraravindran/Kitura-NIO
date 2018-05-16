@@ -5,6 +5,7 @@
 branches:
   only:
     - master
+    - develop
 
 matrix:
   include:
@@ -17,5 +18,5 @@ before_install:
   - git clone https://github.com/IBM-Swift/Package-Builder.git
 
 script:
-  - ulimit -n 65536
+  - sudo ulimit -n 10000
   - ./Package-Builder/build-package.sh -projectDir $TRAVIS_BUILD_DIR
