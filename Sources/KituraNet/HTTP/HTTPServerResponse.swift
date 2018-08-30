@@ -47,13 +47,12 @@ public class HTTPServerResponse: ServerResponse {
     /// The HTTP headers to be sent to the client as part of the response.
     public var headers : HeadersContainer = HeadersContainer()
 
-
     /// The HTTP version to be sent in the response.
     private var httpVersion: HTTPVersion
 
     /// The data to be written as a part of the response.
     private var buffer: ByteBuffer?
-    
+
     init(channel: Channel, handler: HTTPHandler) {
         self.channel = channel
         self.handler = handler
@@ -71,14 +70,9 @@ public class HTTPServerResponse: ServerResponse {
             fatalError("No channel available to write.")
         }
         if buffer == nil {
-            if channel.eventLoop.inEventLoop {
+            runOnEventLoop(channel: channel) {
                 self.buffer = channel.allocator.buffer(capacity: string.utf8.count)
                 self.buffer!.write(string: string)
-            } else {
-                channel.eventLoop.execute {
-                    self.buffer = channel.allocator.buffer(capacity: string.utf8.count)
-                    self.buffer!.write(string: string)
-                }
             }
         }
     }
@@ -91,14 +85,20 @@ public class HTTPServerResponse: ServerResponse {
             fatalError("No channel available to write.")
         }
         if buffer == nil {
-            if channel.eventLoop.inEventLoop {
+            runOnEventLoop(channel: channel) {
                 self.buffer = channel.allocator.buffer(capacity: data.count)
                 self.buffer!.write(bytes: data)
-            } else {
-                channel.eventLoop.execute {
-                    self.buffer = channel.allocator.buffer(capacity: data.count)
-                    self.buffer!.write(bytes: data)
-                }
+            }
+        }
+    }
+
+    /// Execute task on event loop
+    private func runOnEventLoop(channel: Channel, _ task: @escaping () -> Void) {
+        if channel.eventLoop.inEventLoop {
+            task()
+        } else {
+            channel.eventLoop.execute {
+                task()
             }
         }
     }
@@ -115,18 +115,9 @@ public class HTTPServerResponse: ServerResponse {
     ///
     public func end() throws {
         guard let channel = self.channel else {
-            fatalError("No channel handler context available.")
+            fatalError("No channel available.")
         }
-        if channel.eventLoop.inEventLoop {
-            try end0(channel: channel)
-        } else {
-            channel.eventLoop.execute {
-                try! self.end0(channel: channel)
-            }
-        }
-    }
 
-    func end0(channel: Channel) throws {
         guard let handler = self.handler else {
             fatalError("No HTTP handler available")
         }
@@ -140,34 +131,22 @@ public class HTTPServerResponse: ServerResponse {
                 headers["Keep-Alive"] = ["timeout=\(HTTPHandler.keepAliveTimeout)"]
             }
         }
-        let response = HTTPResponseHead(version: httpVersion, status: status, headers: headers.httpHeaders())
-        channel.write(handler.wrapOutboundOut(.head(response)), promise: nil)
-        if let buffer = buffer {
-            channel.write(handler.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
-        }
-        channel.writeAndFlush(handler.wrapOutboundOut(.end(nil)), promise: nil)
-        handler.updateKeepAliveState()
 
-        if let request = handler.serverRequest {
-            Monitor.delegate?.finished(request: request, response: self)
+        runOnEventLoop(channel: channel) {
+            do {
+               try self.sendResponse(channel: channel, handler: handler, status: status)
+            } catch let error {
+                fatalError("Error: \(error)")
+            }
         }
     }
 
     /// End sending the response on an HTTP error
     private func end(with errorCode: HTTPStatusCode, withBody: Bool = false) throws {
         guard let channel = self.channel else {
-            fatalError("No channel handler context available.")
+            fatalError("No channel available.")
         }
-        if channel.eventLoop.inEventLoop {
-            try end0(with: errorCode, channel: channel, withBody: withBody)
-        } else {
-            channel.eventLoop.execute {
-                try! self.end0(with: errorCode, channel: channel, withBody: withBody)
-            }
-        }
-    }
 
-    private func end0(with errorCode: HTTPStatusCode, channel: Channel, withBody: Bool = false) throws {
         guard let handler = self.handler else {
             fatalError("No HTTP handler available")
         }
@@ -177,11 +156,28 @@ public class HTTPServerResponse: ServerResponse {
 
         //We don't keep the connection alive on an HTTP error
         headers["Connection"] = ["Close"]
-        let response = HTTPResponseHead(version: HTTPVersion(major: 1, minor: 1), status: status, headers: headers.httpHeaders())
-        channel.write(handler.wrapOutboundOut(.head(response)), promise: nil)
-        if withBody && buffer != nil {
-            channel.write(handler.wrapOutboundOut(.body(.byteBuffer(buffer!))), promise: nil)
+
+        runOnEventLoop(channel: channel) {
+            do {
+                try self.sendResponse(channel: channel, handler: handler, status: status)
+            } catch let error {
+                fatalError("Error: \(error)")
+            }
         }
+    }
+
+    /// Send response to the client
+    private func sendResponse(channel: Channel, handler: HTTPHandler, status: HTTPResponseStatus, withBody: Bool = false) throws {
+        let response = HTTPResponseHead(version: httpVersion, status: status, headers: headers.httpHeaders())
+        channel.write(handler.wrapOutboundOut(.head(response)), promise: nil)
+        if withBody, let buffer = buffer {
+            channel.write(handler.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        } else {
+            if let buffer = buffer {
+                channel.write(handler.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+            }
+        }
+
         channel.writeAndFlush(handler.wrapOutboundOut(.end(nil)), promise: nil)
         handler.updateKeepAliveState()
 
